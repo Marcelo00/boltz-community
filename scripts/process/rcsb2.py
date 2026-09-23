@@ -113,13 +113,13 @@ def parse(data: PDB, moldir: str, clusters: dict) -> Target:
     """Parse one mmCIF into a StructureV2 target with cluster-annotated chains."""
     # Parse structure. use_assembly=False is load-bearing: it must match the
     # parse settings in create_cluster_file.py so the hashed sequences (and thus
-    # the clustering.json keys) line up. compute_interfaces=True populates the
+    # the clustering.json keys) line up. call_compute_interfaces=True populates the
     # interface table used for interface-level sampling.
     parsed = parse_mmcif(
         str(data.path),
         moldir=moldir,
         use_assembly=False,
-        compute_interfaces=True,
+        call_compute_interfaces=True,
     )
     structure = parsed.data
     structure_info = parsed.info

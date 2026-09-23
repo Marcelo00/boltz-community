@@ -830,7 +830,7 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
     mols: Optional[dict[str, Mol]] = None,
     moldir: Optional[str] = None,
     use_assembly: bool = True,
-    compute_interfaces: bool = True,
+    call_compute_interfaces: bool = True,
 ) -> ParsedStructure:
     """Parse a structure in MMCIF format.
 
@@ -1236,7 +1236,7 @@ def parse_mmcif(  # noqa: C901, PLR0915, PLR0912
     coords = np.array(coords_data, dtype=Coords)
 
     # Compute interface chains (find chains with a heavy atom within 5A)
-    if compute_interfaces:
+    if call_compute_interfaces:
         interfaces = compute_interfaces(atoms, chains)
     else:
         interfaces = np.array([], dtype=Interface)

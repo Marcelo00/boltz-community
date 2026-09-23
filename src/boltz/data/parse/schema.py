@@ -1801,7 +1801,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 mols=ccd,
                 moldir=mol_dir,
                 use_assembly=False,
-                compute_interfaces=False,
+                call_compute_interfaces=False,
             )
         else:
             parsed_template = parse_mmcif(
@@ -1809,7 +1809,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 mols=ccd,
                 moldir=mol_dir,
                 use_assembly=False,
-                compute_interfaces=False,
+                call_compute_interfaces=False,
             )
         template_proteins = {
             str(c["name"])
