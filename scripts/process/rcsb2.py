@@ -268,30 +268,21 @@ def process(args) -> None:
     parallel = num_processes > 1
 
     print("Processing data...")  # noqa: T201
+    # Each worker builds its own per-call CCD cache from moldir; no shared mols
+    # dict is passed across processes.
+    fn = partial(
+        process_structure,
+        moldir=moldir,
+        outdir=args.outdir,
+        clusters=clusters,
+        filters=filters,
+    )
     if parallel:
-        # p_tqdm is a processing-only extra (see requirements.txt); import it
-        # lazily so serial runs work without it.
-        from p_tqdm import p_umap
-
-        # Each worker builds its own per-call CCD cache from moldir; no shared
-        # mols dict is passed across processes.
-        fn = partial(
-            process_structure,
-            moldir=moldir,
-            outdir=args.outdir,
-            clusters=clusters,
-            filters=filters,
-        )
-        p_umap(fn, data, num_cpus=num_processes)
+        with multiprocessing.Pool(processes=num_processes) as pool:
+            list(tqdm(pool.imap_unordered(fn, data), total=len(data)))
     else:
         for item in tqdm(data):
-            process_structure(
-                item,
-                moldir=moldir,
-                outdir=args.outdir,
-                clusters=clusters,
-                filters=filters,
-            )
+            fn(item)
 
     finalize(args.outdir)
 
