@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "boltz-community"
-version = "2.10.9"
+version = "2.11.0"
 requires-python = ">=3.10"
 description = "Community-maintained fork of Boltz with bug fixes, broader compatibility, and CI"
 readme = "README.md"
@@ -72,10 +72,13 @@ Upstream = "https://github.com/jwohlwend/boltz"
 
 [project.scripts]
 boltz = "boltz.main:cli"
+boltz-fix-macos-libomp = "boltz.scripts.fix_macos_libomp:main"
 
 [project.optional-dependencies]
 lint = ["ruff"]
-test = ["pytest", "requests"]
+# gemmi>=0.7.4 adds gemmi.read_structure_string, used only by the mmCIF writer
+# tests. The runtime floor above stays at >=0.6.5 because src/ never calls it.
+test = ["pytest", "requests", "gemmi>=0.7.4"]
 cuda = [
     "cuequivariance_ops_cu12>=0.5.0",
     "cuequivariance_ops_torch_cu12>=0.5.0",
@@ -129,4 +132,5 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "regression",
     "mps: requires Apple Silicon with MPS (run manually with '-m mps')",
+    "xpu: requires an Intel GPU with PyTorch XPU (run manually with '-m xpu')",
 ]

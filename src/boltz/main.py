@@ -1129,7 +1129,7 @@ def _parse_devices(value: str) -> Union[int, List[int]]:
 )
 @click.option(
     "--accelerator",
-    type=click.Choice(["gpu", "cpu", "tpu", "mps"]),
+    type=click.Choice(["gpu", "cpu", "tpu", "mps", "xpu"]),
     help="The accelerator to use for prediction.",
     default="gpu",
 )
@@ -1208,11 +1208,13 @@ def _parse_devices(value: str) -> Union[int, List[int]]:
 @click.option(
     "--override",
     is_flag=True,
+    default=False,
     help="Override existing found predictions.",
 )
 @click.option(
     "--skip_bad_inputs",
     is_flag=True,
+    default=False,
     help="Skip invalid inputs instead of aborting. Default: abort on first error.",
 )
 @click.option(
@@ -1224,6 +1226,7 @@ def _parse_devices(value: str) -> Union[int, List[int]]:
 @click.option(
     "--use_msa_server",
     is_flag=True,
+    default=False,
     help="Whether to use the MMSeqs2 server for MSA generation.",
 )
 @click.option(
@@ -1265,6 +1268,7 @@ def _parse_devices(value: str) -> Union[int, List[int]]:
 @click.option(
     "--use_potentials",
     is_flag=True,
+    default=False,
     help="Whether to use potentials for steering.",
 )
 @click.option(
@@ -1288,6 +1292,7 @@ def _parse_devices(value: str) -> Union[int, List[int]]:
 @click.option(
     "--affinity_mw_correction",
     is_flag=True,
+    default=False,
     type=bool,
     help="Whether to add the Molecular Weight correction to the affinity value head.",
 )
@@ -1329,11 +1334,13 @@ def _parse_devices(value: str) -> Union[int, List[int]]:
 @click.option(
     "--no_kernels",
     is_flag=True,
+    default=False,
     help="Whether to disable the kernels.",
 )
 @click.option(
     "--flash_attn",
     is_flag=True,
+    default=False,
     help=(
         "Enable PyTorch scaled_dot_product_attention (FlashAttention-2 / "
         "memory-efficient attention) for all attention layers. "
@@ -1345,6 +1352,7 @@ def _parse_devices(value: str) -> Union[int, List[int]]:
 @click.option(
     "--write_embeddings",
     is_flag=True,
+    default=False,
     help="Whether to dump the s and z embeddings into a npz file.",
 )
 def predict(  # noqa: C901, PLR0915, PLR0912
@@ -1392,7 +1400,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     """Run predictions with Boltz."""
     import torch
     from pytorch_lightning import Trainer, seed_everything
-    from pytorch_lightning.strategies import DDPStrategy
+    from pytorch_lightning.strategies import DDPStrategy, SingleDeviceStrategy
     from rdkit import Chem
 
     from boltz.data import const
@@ -1446,6 +1454,23 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             raise click.UsageError(msg)
         click.echo("Running on Apple Silicon GPU (MPS).")
 
+    # XPU (Intel GPU) validation and info
+    if accelerator == "xpu":
+        from boltz.xpu import register_xpu_accelerator, xpu_available
+
+        if not xpu_available():
+            msg = (
+                "XPU accelerator requested but not available. XPU requires an "
+                "Intel GPU and a PyTorch build with XPU support "
+                "(pip install torch --index-url https://download.pytorch.org/whl/xpu)."
+            )
+            raise click.UsageError(msg)
+        register_xpu_accelerator()
+        xpu_index = devices[0] if isinstance(devices, list) else 0
+        click.echo(
+            f"Running on Intel GPU (XPU): {torch.xpu.get_device_name(xpu_index)}."
+        )
+
     # Supress some lightning warnings
     warnings.filterwarnings(
         "ignore", ".*that has Tensor Cores. To properly utilize them.*"
@@ -1463,6 +1488,14 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     # Set seed if desired
     if seed is not None:
         seed_everything(seed)
+        # With default algorithms, XPU reruns differ in the last digits of the
+        # output. Deterministic algorithms make --seed byte-reproducible on XPU,
+        # as it already is on CUDA, for ~3% extra time. warn_only=True makes this
+        # empirical, not guaranteed: it holds for the ops Boltz currently runs
+        # (none warned in testing); an op added later without a deterministic
+        # XPU kernel would warn instead of failing.
+        if accelerator == "xpu":
+            torch.use_deterministic_algorithms(True, warn_only=True)
 
     for key in ["CUEQ_DEFAULT_CONFIG", "CUEQ_DISABLE_AOT_TUNING"]:
         # Disable kernel tuning by default,
@@ -1586,6 +1619,14 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             click.echo("Warning: MPS only supports a single device, ignoring --devices.")
         devices = 1
         strategy = "auto"
+    elif accelerator == "xpu":
+        # Single Intel GPU for now; multi-XPU DDP is not wired up
+        if (isinstance(devices, int) and devices > 1) or (
+            isinstance(devices, list) and len(devices) > 1
+        ):
+            click.echo("Warning: XPU currently supports a single device, using the first.")
+        devices = [xpu_index]
+        strategy = SingleDeviceStrategy(device=torch.device("xpu", xpu_index))
     elif (isinstance(devices, int) and devices > 1) or (
         isinstance(devices, list) and len(devices) > 1
     ):
@@ -1638,6 +1679,15 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     else:
         precision = "bf16-mixed"
 
+    # Lightning only knows how to autocast on cpu, mps and cuda: for any other
+    # accelerator a "bf16-mixed" flag becomes torch.autocast("cuda"), which does
+    # nothing on an Intel GPU and silently runs fp32. Pass the plugin explicitly.
+    precision_args: dict = {"precision": precision}
+    if accelerator == "xpu" and precision == "bf16-mixed":
+        from pytorch_lightning.plugins.precision import MixedPrecision
+
+        precision_args = {"plugins": [MixedPrecision("bf16-mixed", device="xpu")]}
+
     # Set up trainer
     trainer = Trainer(
         default_root_dir=out_dir,
@@ -1645,17 +1695,17 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         callbacks=[pred_writer],
         accelerator=accelerator,
         devices=devices,
-        precision=precision,
+        **precision_args,
     )
 
-    if accelerator == "cpu":
-        map_location = "cpu"
-    elif accelerator == "mps":
-        map_location = "mps"
-    else:
-        map_location = "cuda"
+    # Lightning constructs the model on CPU before loading its state dict. If
+    # checkpoint tensors are deserialized directly onto the accelerator,
+    # load_state_dict copies every tensor back to CPU individually and then
+    # Trainer moves the completed model to the accelerator again. Staging the
+    # checkpoint on CPU avoids that device round trip.
+    map_location = "cpu"
 
-    pin_memory = accelerator not in ("cpu", "mps")
+    pin_memory = accelerator not in ("cpu", "mps", "xpu")
 
     if filtered_manifest.records:
         msg = f"Running structure prediction for {len(filtered_manifest.records)} input"
