@@ -22,9 +22,10 @@ Consistency contract: this script and ``clusterv2.py`` MUST parse with
 the same parser and ``use_assembly=False`` and hash the same
 ``gemmi.one_letter_code`` string, or every ``cluster_id`` falls through to -1.
 
-A file that fails to parse is skipped and listed in ``failed.txt``; the run only
-aborts when more than ``--max-failure-fraction`` of the files fail. Re-running
-resumes: finished structures are kept and the manifest covers ``--datadir`` only.
+A file that fails to parse is skipped and reported in ``rcsbv2_report.csv`` in
+``--outdir`` (same columns as ``build_mmcif_report.csv``); the run only aborts when more than
+``--max-failure-fraction`` of the files fail. Re-running resumes: finished
+structures are kept and the manifest covers ``--datadir`` only.
 
 Run::
 
@@ -36,6 +37,7 @@ Run::
 """
 
 import argparse
+import csv
 import json
 import multiprocessing
 from collections import Counter
@@ -69,12 +71,16 @@ class TargetV2:
     structure: StructureV2
 
 
+REPORT_FILENAME = "rcsbv2_report.csv"
+
+
 @dataclass(frozen=True)
 class Outcome:
-    """Result of processing one structure; ``error`` is set when it failed."""
+    """Result of processing one structure: ok, skipped (done before) or error."""
 
     id: str
-    error: Optional[str] = None
+    status: str = "ok"
+    error: str = ""
 
 
 class PDB:
@@ -130,10 +136,12 @@ def finalize(outdir: Path, ids: list[str]) -> None:
         json.dump(records, f)
 
 
-def write_failures(outdir: Path, failed: list[Outcome]) -> None:
-    """List the failed structures, one ``id<TAB>error`` line each."""
-    lines = [f"{outcome.id}\t{outcome.error}" for outcome in failed]
-    (outdir / "failed.txt").write_text("".join(f"{line}\n" for line in lines))
+def write_report(outdir: Path, outcomes: list[Outcome]) -> None:
+    """Write one ``sim_id, status, error`` row per structure."""
+    with (outdir / REPORT_FILENAME).open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["sim_id", "status", "error"])
+        writer.writerows((o.id, o.status, o.error) for o in outcomes)
 
 
 def parse(data: PDB, moldir: str, clusters: dict) -> TargetV2:
@@ -241,13 +249,13 @@ def process_structure(
     record_path = outdir / "records" / f"{data.id}.json"
 
     if struct_path.exists() and record_path.exists():
-        return Outcome(data.id)
+        return Outcome(data.id, "skipped")
 
     try:
         target: TargetV2 = parse(data, moldir, clusters)
         mask = apply_filters(target.structure, filters)
     except Exception as exc:  # noqa: BLE001
-        return Outcome(data.id, f"{type(exc).__name__}: {exc}")
+        return Outcome(data.id, "error", f"{type(exc).__name__}: {exc}")
 
     # Write the validity mask back into chains and interfaces
     chains = [
@@ -326,12 +334,12 @@ def process(args) -> None:
     )
     outcomes = run_all(fn, data, num_processes)
 
-    failed = [outcome for outcome in outcomes if outcome.error]
-    write_failures(args.outdir, failed)
+    failed = [outcome for outcome in outcomes if outcome.status == "error"]
+    write_report(args.outdir, outcomes)
     finalize(args.outdir, [pdb.id for pdb in data])
     print(f"Processed {len(data) - len(failed)}/{len(data)} structures.")  # noqa: T201
     if failed:
-        print(f"{len(failed)} failed, listed in {args.outdir / 'failed.txt'}")  # noqa: T201
+        print(f"{len(failed)} failed, see {args.outdir / REPORT_FILENAME}")  # noqa: T201
     if len(failed) > args.max_failure_fraction * len(data):
         msg = f"More than {args.max_failure_fraction:.0%} of the structures failed."
         raise SystemExit(msg)
