@@ -511,14 +511,14 @@ class Boltz2(LightningModule):
                 "z": z,
             }
 
+            # Sampling: inference, or predicted coords for the confidence head
+            needs_sampling = (not self.training) or self.confidence_prediction
+            # Denoising pass for the structure loss
+            needs_training_pass = self.training and self.structure_prediction_training
             if (
                 self.run_trunk_and_structure
-                and (
-                    (not self.training)
-                    or self.confidence_prediction
-                    or self.structure_prediction_training
-                )
                 and (not self.skip_run_structure)
+                and (needs_sampling or needs_training_pass)
             ):
                 if self.checkpoint_diffusion_conditioning and self.training:
                     # TODO decide whether this should be with bf16 or not
@@ -549,7 +549,7 @@ class Boltz2(LightningModule):
                     "token_trans_bias": token_trans_bias,
                 }
 
-                if (not self.training) or self.confidence_prediction:
+                if needs_sampling:
                     with torch.autocast(
                         autocast_device_type(s.device.type), enabled=False
                     ):
@@ -577,7 +577,7 @@ class Boltz2(LightningModule):
                 )
 
             # Compute structure module
-            if self.training and self.structure_prediction_training:
+            if needs_training_pass:
                 atom_coords = feats["coords"]
                 B, K, L = atom_coords.shape[0:3]
                 assert K in (
