@@ -103,6 +103,9 @@ class Boltz2(LightningModule):
         use_templates: bool = False,
         compile_templates: bool = False,
         predict_bfactor: bool = False,
+        bfactor_num_bins: int = 64,
+        bfactor_min: float = 5.0,
+        bfactor_max: float = 3000.0,
         log_loss_every_steps: int = 50,
         checkpoint_diffusion_conditioning: bool = False,
         use_templates_v2: bool = False,
@@ -296,7 +299,9 @@ class Boltz2(LightningModule):
         )
         self.predict_bfactor = predict_bfactor
         if predict_bfactor:
-            self.bfactor_module = BFactorModule(token_s, num_bins)
+            self.bfactor_module = BFactorModule(
+                token_s, bfactor_num_bins, bfactor_min, bfactor_max
+            )
 
         self.confidence_prediction = confidence_prediction
         self.affinity_prediction = affinity_prediction
@@ -864,7 +869,9 @@ class Boltz2(LightningModule):
             self.num_skipped_batches = 0
 
             if self.predict_bfactor:
-                bfactor_loss = bfactor_loss_fn(out, batch)
+                bfactor_loss = bfactor_loss_fn(
+                    out, batch, self.bfactor_module.boundaries
+                )
             else:
                 bfactor_loss = 0.0
 
@@ -937,6 +944,8 @@ class Boltz2(LightningModule):
                 self.log("train/diffusion_loss", diffusion_loss_dict["loss"])
                 for k, v in diffusion_loss_dict["loss_breakdown"].items():
                     self.log(f"train/{k}", v)
+                if self.predict_bfactor:
+                    self.log("train/bfactor_loss", bfactor_loss)
 
             if self.confidence_prediction:
                 self.train_confidence_loss_logger.update(
@@ -1255,6 +1264,20 @@ class Boltz2(LightningModule):
         return optimizer
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        state_dict = checkpoint["state_dict"]
+        if self.predict_bfactor:
+            if "bfactor_module.boundaries" not in state_dict:
+                # Checkpoints without boundaries predate the log-spaced bins; their
+                # bfactor head predicts crystallographic B in other bins, so keep the
+                # freshly initialised head.
+                for key in [k for k in state_dict if k.startswith("bfactor_module.")]:
+                    del state_dict[key]
+            else:
+                assert torch.allclose(
+                    state_dict["bfactor_module.boundaries"],
+                    self.bfactor_module.boundaries,
+                ), "The bfactor bin edges in the checkpoint differ from the config"
+
         # Ignore the lr from the checkpoint
         lr = self.training_args.max_lr
         weight_decay = self.training_args.weight_decay

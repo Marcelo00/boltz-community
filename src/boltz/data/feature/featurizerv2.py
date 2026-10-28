@@ -1564,9 +1564,8 @@ def process_atom_features(
         bfactor = bfactor * 0.0
 
     if bfactor_md_correction and data.record.structure.method.lower() == "md":
-        # MD bfactor was computed as RMSF
-        # Convert to b-factor
-        bfactor = 8 * (np.pi**2) * (bfactor**2)
+        # MD bfactor was computed as the 3D RMSF, so B = 8 pi^2 / 3 * RMSF^2
+        bfactor = 8 * (np.pi**2) / 3 * (bfactor**2)
 
     # We compute frames within ensemble
     if compute_frames:

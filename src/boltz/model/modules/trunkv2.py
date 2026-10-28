@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import Tensor, nn
 from torch.nn.functional import one_hot
@@ -783,18 +785,31 @@ class MSALayer(nn.Module):
 class BFactorModule(nn.Module):
     """BFactor Module."""
 
-    def __init__(self, token_s: int, num_bins: int) -> None:
+    def __init__(
+        self, token_s: int, num_bins: int, b_min: float, b_max: float
+    ) -> None:
         """Initialize the bfactor module.
 
         Parameters
         ----------
         token_s : int
             The token embedding size.
+        num_bins : int
+            The number of bfactor bins.
+        b_min : float
+            The first bin edge (A^2), bins are log-spaced up to b_max.
+        b_max : float
+            The last bin edge (A^2).
 
         """
         super().__init__()
         self.bfactor = nn.Linear(token_s, num_bins)
         self.num_bins = num_bins
+        # A buffer, so that the checkpoint carries the edges used in training
+        self.register_buffer(
+            "boundaries",
+            torch.logspace(math.log10(b_min), math.log10(b_max), num_bins - 1),
+        )
 
     def forward(self, s: Tensor) -> Tensor:
         """Perform the forward pass.
