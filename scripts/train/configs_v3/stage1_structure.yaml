@@ -1,0 +1,114 @@
+trainer:
+  accelerator: gpu
+  devices: 1
+  precision: bf16-mixed
+  gradient_clip_val: 10.0
+  max_steps: 4000
+  max_epochs: -1
+  accumulate_grad_batches: 32
+  log_every_n_steps: 1
+  val_check_interval: 12800
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 1
+
+# Optional set wandb here
+# wandb:
+#   name: boltz2_md
+#   project: boltz2_md
+#   entity: boltz
+
+output: SET_PATH_HERE
+pretrained: PATH_TO_BOLTZ2_CHECKPOINT
+resume: null
+matmul_precision: null
+save_top_k: 2
+validation_only: false
+
+data:
+  datasets:
+    - _target_: boltz.data.module.trainingv3.DatasetConfig
+      target_dir: PATH_TO_RCSBV2_OUTPUT_DIR
+      prob: 1.0
+      sampler:
+        _target_: boltz.data.sample.cluster.ClusterSampler
+      cropper:
+        _target_: boltz.data.crop.boltz.BoltzCropper
+        min_neighborhood: 0
+        max_neighborhood: 40
+      split: PATH_TO_VAL_IDS_TXT
+
+  filters: []
+
+  mol_dir: PATH_TO_BOLTZ_MOLS_DIR
+  max_tokens: 512
+  max_atoms: 4608
+  samples_per_epoch: 10000
+  batch_size: 1
+  num_workers: 4
+  pin_memory: true
+  overfit: null
+  min_dist: 2.0
+  max_dist: 22.0
+  num_bins: 64
+  atoms_per_window_queries: 32
+  num_ensembles: ${model.training_args.diffusion_multiplicity}
+  ensemble_sample_replacement: true
+  fix_single_ensemble: false
+  disto_use_ensemble: true
+  override_method: md
+  bfactor_md_correction: true
+  val_name: md_val
+  num_val_records: 35
+  val_seed: 0
+
+# Overrides for the checkpoint hyperparameters; the architecture comes from the checkpoint.
+model:
+  structure_prediction_training: true
+  confidence_prediction: false
+  validate_structure: true
+  num_val_datasets: 1
+  validators:
+    - _target_: boltz.model.validation.md.MDValidator
+      val_names:
+        - ${data.val_name}
+  predict_bfactor: true
+  bfactor_num_bins: 64
+  bfactor_min: 5.0
+  bfactor_max: 3000.0
+  ema: true
+  ema_decay: 0.999
+  use_kernels: false
+  use_flash_attn: false
+  log_loss_every_steps: 1
+
+  training_args:
+    recycling_steps: 3
+    sampling_steps: 50
+    diffusion_multiplicity: 4
+    diffusion_samples: 1
+    confidence_loss_weight: 0.0
+    diffusion_loss_weight: 4.0
+    distogram_loss_weight: 3e-2
+    bfactor_loss_weight: 1e-3
+    adam_beta_1: 0.9
+    adam_beta_2: 0.95
+    adam_eps: 0.00000001
+    lr_scheduler: af3
+    base_lr: 0.0
+    max_lr: 1e-4
+    lr_warmup_no_steps: 200
+    lr_start_decay_after_n_steps: 50000
+    lr_decay_every_n_steps: 50000
+    lr_decay_factor: 0.95
+    weight_decay: 0.003
+    weight_decay_exclude: true
+
+  validation_args:
+    recycling_steps: 3
+    sampling_steps: 200
+    diffusion_samples: 5
+
+  diffusion_loss_args:
+    add_smooth_lddt_loss: true
+    nucleotide_loss_weight: 5.0
+    ligand_loss_weight: 10.0

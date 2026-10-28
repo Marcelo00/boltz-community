@@ -37,6 +37,8 @@ from boltz.model.modules.trunkv2 import (
 from boltz.model.optim.ema import EMA
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
 
+MAX_CONSECUTIVE_SKIPPED_BATCHES = 10
+
 
 class Boltz2(LightningModule):
     """Boltz2 model."""
@@ -125,6 +127,7 @@ class Boltz2(LightningModule):
 
         self.num_val_datasets = num_val_datasets
         self.log_loss_every_steps = log_loss_every_steps
+        self.num_skipped_batches = 0
 
         # EMA
         self.use_ema = ema
@@ -510,7 +513,11 @@ class Boltz2(LightningModule):
 
             if (
                 self.run_trunk_and_structure
-                and ((not self.training) or self.confidence_prediction)
+                and (
+                    (not self.training)
+                    or self.confidence_prediction
+                    or self.structure_prediction_training
+                )
                 and (not self.skip_run_structure)
             ):
                 if self.checkpoint_diffusion_conditioning and self.training:
@@ -542,19 +549,22 @@ class Boltz2(LightningModule):
                     "token_trans_bias": token_trans_bias,
                 }
 
-                with torch.autocast(autocast_device_type(s.device.type), enabled=False):
-                    struct_out = self.structure_module.sample(
-                        s_trunk=s.float(),
-                        s_inputs=s_inputs.float(),
-                        feats=feats,
-                        num_sampling_steps=num_sampling_steps,
-                        atom_mask=feats["atom_pad_mask"].float(),
-                        multiplicity=diffusion_samples,
-                        max_parallel_samples=max_parallel_samples,
-                        steering_args=self.steering_args,
-                        diffusion_conditioning=diffusion_conditioning,
-                    )
-                    dict_out.update(struct_out)
+                if (not self.training) or self.confidence_prediction:
+                    with torch.autocast(
+                        autocast_device_type(s.device.type), enabled=False
+                    ):
+                        struct_out = self.structure_module.sample(
+                            s_trunk=s.float(),
+                            s_inputs=s_inputs.float(),
+                            feats=feats,
+                            num_sampling_steps=num_sampling_steps,
+                            atom_mask=feats["atom_pad_mask"].float(),
+                            multiplicity=diffusion_samples,
+                            max_parallel_samples=max_parallel_samples,
+                            steering_args=self.steering_args,
+                            diffusion_conditioning=diffusion_conditioning,
+                        )
+                        dict_out.update(struct_out)
 
                 if self.predict_bfactor:
                     pbfactor = self.bfactor_module(s)
@@ -847,7 +857,11 @@ class Boltz2(LightningModule):
                 )
             except Exception as e:
                 print(f"Skipping batch {batch_idx} due to error: {e}")
+                self.num_skipped_batches += 1
+                if self.num_skipped_batches >= MAX_CONSECUTIVE_SKIPPED_BATCHES:
+                    raise
                 return None
+            self.num_skipped_batches = 0
 
             if self.predict_bfactor:
                 bfactor_loss = bfactor_loss_fn(out, batch)
@@ -918,7 +932,7 @@ class Boltz2(LightningModule):
 
         if not (self.global_step % self.log_loss_every_steps):
             # Log losses
-            if self.validate_structure:
+            if self.structure_prediction_training:
                 self.log("train/distogram_loss", disto_loss)
                 self.log("train/diffusion_loss", diffusion_loss_dict["loss"])
                 for k, v in diffusion_loss_dict["loss_breakdown"].items():
