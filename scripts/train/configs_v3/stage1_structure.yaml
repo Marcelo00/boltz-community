@@ -1,3 +1,18 @@
+# Two-step fine-tuning (linear probing, then end-to-end), both with this file:
+#
+# 1. Probe: train only the distogram and bfactor heads on the frozen model, until
+#    val/bfactor_loss plateaus. The structure metrics (val/lddt, val/rmsd) are not
+#    meaningful here, so the validation sampling is made cheap.
+#      train_only=[distogram_module,bfactor_module] model.ema=false
+#      model.training_args.max_lr=1e-3 model.validation_args.sampling_steps=2
+#      model.validation_args.diffusion_samples=1
+#      monitor=val/bfactor_loss monitor_mode=min trainer.max_steps=<steps>
+# 2. Fine-tune everything from the best probe checkpoint (no overrides but this):
+#      pretrained=<probe checkpoint>
+#
+# Dataset paths (data.datasets[0].target_dir and split) must be set in a copy of this
+# file, list items cannot be overridden from the command line.
+
 trainer:
   accelerator: gpu
   devices: 1

@@ -309,6 +309,7 @@ class ValidationDataset(BaseDataset):
             training=False,
             num_ensembles=1,
             fix_single_ensemble=True,
+            disto_use_ensemble=self.cfg.disto_use_ensemble,
         )
         features["idx_dataset"] = torch.tensor(0)
         return features

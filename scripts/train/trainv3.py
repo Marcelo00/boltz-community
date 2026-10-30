@@ -15,6 +15,7 @@ from pytorch_lightning.utilities import rank_zero_only
 
 from boltz.data.module.trainingv3 import BoltzTrainingDataModule, DataConfig
 from boltz.model.models.boltz2 import Boltz2
+from boltz.model.optim.train_only import TrainOnly
 
 
 @dataclass
@@ -42,7 +43,14 @@ class TrainConfig:
     find_unused_parameters : Optional[bool]
         Find unused parameters.
     save_top_k : Optional[int]
-        Save the top k checkpoints by validation lddt.
+        Save the top k checkpoints by the monitored validation metric.
+    monitor : str
+        The validation metric selecting the checkpoints.
+    monitor_mode : str
+        Whether the monitored metric is maximized ("max") or minimized ("min").
+    train_only : Optional[list[str]]
+        Train only these top-level modules and freeze the rest, e.g. to linear probe
+        the distogram and bfactor heads before the end-to-end fine-tuning.
     validation_only : bool
         Run validation only, on the pretrained or the resumed model.
     debug : bool
@@ -60,6 +68,9 @@ class TrainConfig:
     matmul_precision: Optional[str] = None
     find_unused_parameters: Optional[bool] = False
     save_top_k: Optional[int] = 1
+    monitor: str = "val/lddt"
+    monitor_mode: str = "max"
+    train_only: Optional[list[str]] = None
     validation_only: bool = False
     debug: bool = False
 
@@ -137,12 +148,15 @@ def train(raw_config: str, args: list[str]) -> None:
 
     callbacks = [
         ModelCheckpoint(
-            monitor="val/lddt",
-            mode="max",
+            monitor=cfg.monitor,
+            mode=cfg.monitor_mode,
             save_top_k=cfg.save_top_k,
             save_last=True,
         )
     ]
+    
+    if cfg.train_only:
+        callbacks.append(TrainOnly(cfg.train_only))
 
     loggers = []
     if wandb:

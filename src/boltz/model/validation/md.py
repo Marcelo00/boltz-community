@@ -3,6 +3,8 @@ from torch import Tensor, nn
 from torchmetrics import MeanMetric
 
 from boltz.data import const
+from boltz.model.loss.bfactor import bfactor_loss_fn
+from boltz.model.loss.distogramv2 import distogram_loss
 from boltz.model.loss.validation import factored_lddt_loss, weighted_minimum_rmsd
 
 _METRICS = [
@@ -10,6 +12,8 @@ _METRICS = [
     "lddt_best",
     "rmsd",
     "rmsd_best",
+    "disto_loss",
+    "bfactor_loss",
     *(f"lddt_{name}{suffix}" for name in const.out_types for suffix in ("", "_best")),
 ]
 
@@ -58,12 +62,12 @@ class MDValidator(nn.Module):
 
     def process(
         self,
-        model: nn.Module,  # noqa: ARG002
+        model: nn.Module,
         batch: dict[str, Tensor],
         out: dict[str, Tensor],
         idx_dataset: int,  # noqa: ARG002
     ) -> None:
-        """Accumulate the lDDT and RMSD of the sampled structures.
+        """Accumulate the lDDT and RMSD of the sampled structures and the head losses.
 
         Parameters
         ----------
@@ -100,6 +104,22 @@ class MDValidator(nn.Module):
         rmsd, best_rmsd = weighted_minimum_rmsd(samples, batch, multiplicity=num_samples)
         self._update("rmsd", rmsd.mean())
         self._update("rmsd_best", best_rmsd.mean())
+
+        self._process_heads(model, batch, out)
+
+    def _process_heads(
+        self, model: nn.Module, batch: dict[str, Tensor], out: dict[str, Tensor]
+    ) -> None:
+        """Accumulate the losses of the distogram and bfactor heads."""
+        disto_loss, _ = distogram_loss(
+            out, batch, aggregate_distogram=model.aggregate_distogram
+        )
+        self._update("disto_loss", disto_loss)
+        if model.predict_bfactor:
+            self._update(
+                "bfactor_loss",
+                bfactor_loss_fn(out, batch, model.bfactor_module.boundaries),
+            )
 
     def on_epoch_end(self, model: nn.Module) -> None:
         """Log and reset the accumulated metrics.
