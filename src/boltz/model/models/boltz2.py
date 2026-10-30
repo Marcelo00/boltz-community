@@ -515,6 +515,9 @@ class Boltz2(LightningModule):
                 "s": s,
                 "z": z,
             }
+            
+            if self.predict_bfactor:
+                dict_out["pbfactor"] = self.bfactor_module(s)
 
             # Sampling: inference, or predicted coords for the confidence head
             needs_sampling = (not self.training) or self.confidence_prediction
@@ -570,10 +573,6 @@ class Boltz2(LightningModule):
                             diffusion_conditioning=diffusion_conditioning,
                         )
                         dict_out.update(struct_out)
-
-                if self.predict_bfactor:
-                    pbfactor = self.bfactor_module(s)
-                    dict_out["pbfactor"] = pbfactor
 
             if self.training and self.confidence_prediction:
                 assert len(feats["coords"].shape) == 4
