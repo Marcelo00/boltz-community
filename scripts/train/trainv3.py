@@ -162,7 +162,7 @@ def train(raw_config: str, args: list[str]) -> None:
     if wandb:
         wandb_logger = WandbLogger(
             name=wandb["name"],
-            group=wandb["name"],
+            group=wandb.get("group", wandb["name"]),
             save_dir=cfg.output,
             project=wandb["project"],
             entity=wandb["entity"],
