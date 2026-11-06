@@ -515,7 +515,7 @@ class Boltz2(LightningModule):
                 "s": s,
                 "z": z,
             }
-            
+
             if self.predict_bfactor:
                 dict_out["pbfactor"] = self.bfactor_module(s)
 
@@ -988,6 +988,19 @@ class Boltz2(LightningModule):
             self.parameter_norm(self.structure_module),
             prog_bar=False,
         )
+
+        modules = {
+            "msa_module": self.msa_module,
+            "pairformer_module": self.pairformer_module,
+            "structure_module": self.structure_module,
+            "distogram_module": self.distogram_module,
+        }
+        if self.predict_bfactor:
+            modules["bfactor_module"] = self.bfactor_module
+        for name, module in modules.items():
+            self.log(
+                f"train/grad_norm_{name}", self.gradient_norm(module), prog_bar=False
+            )
 
         if self.confidence_prediction:
             self.log(

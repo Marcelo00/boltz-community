@@ -1,6 +1,8 @@
 from types import SimpleNamespace
+from unittest.mock import PropertyMock, patch
 
 import pytest
+import torch
 from torch import nn
 
 from boltz.model.models import boltz2
@@ -109,3 +111,38 @@ def test_load_checkpoint_rejects_different_boundaries(dummy_submodules):
 
     with pytest.raises(AssertionError, match="bin edges"):
         model.on_load_checkpoint(checkpoint)
+
+
+def _logged_by_training_log(model):
+    """The values logged by training_log, with a stub trainer that only knows the lr."""
+    logged = {}
+    model.log = lambda name, value, **kwargs: logged.__setitem__(name, value)
+    optimizer = SimpleNamespace(param_groups=[{"lr": 1e-4}])
+    trainer = SimpleNamespace(optimizers=[optimizer])
+    with patch.object(boltz2.Boltz2, "trainer", new_callable=PropertyMock) as mock:
+        mock.return_value = trainer
+        model.training_log()
+    return logged
+
+
+def test_training_log_has_the_gradient_norm_of_each_module(dummy_submodules):
+    model = _bfactor_model()
+    for p in model.bfactor_module.parameters():
+        p.grad = torch.full_like(p, 2.0)
+    expected = torch.tensor(sum(p.numel() for p in model.bfactor_module.parameters()) * 4.0).sqrt()
+
+    logged = _logged_by_training_log(model)
+
+    assert torch.isclose(logged["train/grad_norm_bfactor_module"], expected)
+    for name in ("msa_module", "pairformer_module", "structure_module", "distogram_module"):
+        assert logged[f"train/grad_norm_{name}"] == 0  # the dummy modules have no parameters
+
+
+def test_training_log_skips_the_bfactor_gradient_norm_without_the_head(dummy_submodules):
+    training_args = SimpleNamespace(max_lr=1e-4, weight_decay=0.0)
+    model = _minimal_boltz2(False, predict_bfactor=False, training_args=training_args)
+
+    logged = _logged_by_training_log(model)
+
+    assert "train/grad_norm_bfactor_module" not in logged
+    assert "train/grad_norm_distogram_module" in logged
