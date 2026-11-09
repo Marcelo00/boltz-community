@@ -60,6 +60,7 @@ data:
   val_name: md_val
   num_val_records: 35
   val_seed: 0
+  val_num_ensembles: 20
 
 # Overrides for the checkpoint hyperparameters; the architecture comes from the checkpoint.
 model:
@@ -71,6 +72,7 @@ model:
     - _target_: boltz.model.validation.md.MDValidator
       val_names:
         - ${data.val_name}
+      seed: 0
   predict_bfactor: true
   bfactor_num_bins: 64
   bfactor_min: 5.0

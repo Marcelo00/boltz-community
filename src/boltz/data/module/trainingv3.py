@@ -1,3 +1,4 @@
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -62,6 +63,7 @@ class DataConfig:
     val_name: str = "md_val"
     num_val_records: Optional[int] = None
     val_seed: int = 0
+    val_num_ensembles: int = 20
     overfit: Optional[int] = None
 
 
@@ -262,7 +264,10 @@ def select_validation_records(records: list[Record], cfg: DataConfig) -> list[Re
 
 
 class ValidationDataset(BaseDataset):
-    """Dataset over the selected records of each dataset, scored against frame 0.
+    """Dataset over the selected records of each dataset, with fixed random MD frames.
+
+    Each record gets ``val_num_ensembles`` frames drawn without replacement, seeded by
+    the record id, so the same frames are used in every validation round.
 
     With ``overfit`` the datasets are the training ones, so validation measures how
     well the training records are fit.
@@ -301,17 +306,25 @@ class ValidationDataset(BaseDataset):
 
         """
         dataset, record = self.records[idx]
+        # Seeds the frame selection, the crop and the sampling noise per record, so
+        # they do not change when the list of validation records changes
+        record_key = zlib.crc32(record.id.encode())
+
         features = self._featurize(
             dataset,
             Sample(record=record),
-            random=np.random.default_rng(idx),
-            crop_random=np.random.RandomState(idx),
+            random=np.random.default_rng(record_key),
+            crop_random=np.random.RandomState(record_key),
             training=False,
-            num_ensembles=1,
-            fix_single_ensemble=True,
+            num_ensembles=self.cfg.val_num_ensembles,
+            ensemble_sample_replacement=False,
+            fix_single_ensemble=False,
             disto_use_ensemble=self.cfg.disto_use_ensemble,
         )
         features["idx_dataset"] = torch.tensor(0)
+
+        # Used in the run_model() logic of the MDValidator Class
+        features["record_key"] = torch.tensor(record_key)
         return features
 
     def __len__(self) -> int:
