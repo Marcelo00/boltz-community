@@ -19,23 +19,29 @@ _METRICS = [
 
 
 class MDValidator(nn.Module):
-    """Score sampled structures against the first frame of the MD ensemble."""
+    """Score sampled structures against the first of the selected MD frames."""
 
-    def __init__(self, val_names: list[str]) -> None:
+    def __init__(self, val_names: list[str], seed: int = 0) -> None:
         """Initialize the validator.
 
         Parameters
         ----------
         val_names : list[str]
             The labels of the validation groups to score.
+        seed : int
+            The base seed of the sampling noise; the record key is added to it.
 
         """
         super().__init__()
         self.val_names = val_names
+        self.seed = seed
         self.metrics = nn.ModuleDict({name: MeanMetric() for name in _METRICS})
 
     def run_model(self, model: nn.Module, batch: dict[str, Tensor], idx_dataset: int):
         """Sample structures for the batch with the validation settings.
+
+        The noise is fixed per record, and the global RNG is restored afterwards so
+        the training noise is unaffected.
 
         Parameters
         ----------
@@ -53,12 +59,14 @@ class MDValidator(nn.Module):
 
         """
         args = model.validation_args
-        return model(
-            batch,
-            recycling_steps=args.recycling_steps,
-            num_sampling_steps=args.sampling_steps,
-            diffusion_samples=args.diffusion_samples,
-        )
+        with torch.random.fork_rng():
+            torch.manual_seed(self.seed + int(batch["record_key"]))
+            return model(
+                batch,
+                recycling_steps=args.recycling_steps,
+                num_sampling_steps=args.sampling_steps,
+                diffusion_samples=args.diffusion_samples,
+            )
 
     def process(
         self,
