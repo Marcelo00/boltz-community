@@ -36,7 +36,12 @@ output: SET_PATH_HERE
 pretrained: PATH_TO_BOLTZ2_CHECKPOINT
 resume: null
 matmul_precision: null
-save_top_k: 2
+# val/cov scores how well the samples cover the MD frames of a record. Unlike the frame-0
+# metrics (val/lddt), it prefers a diverse sample set over a collapsed one at equal accuracy.
+# The ligand metrics are logged as well and decide between the saved checkpoints afterwards.
+monitor: val/cov
+monitor_mode: max
+save_top_k: 1
 validation_only: false
 
 data:
@@ -75,7 +80,8 @@ data:
   val_name: md_val
   num_val_records: 35
   val_seed: 0
-  val_num_ensembles: 20
+  # null = every MD frame of a record, in trajectory order, which the MD validator needs
+  val_num_ensembles: null
 
 # Overrides for the checkpoint hyperparameters; the architecture comes from the checkpoint.
 model:
@@ -123,7 +129,7 @@ model:
   validation_args:
     recycling_steps: 3
     sampling_steps: 200
-    diffusion_samples: 5
+    diffusion_samples: 20
 
   diffusion_loss_args:
     add_smooth_lddt_loss: true
