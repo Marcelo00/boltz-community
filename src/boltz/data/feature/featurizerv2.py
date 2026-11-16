@@ -1980,7 +1980,7 @@ def process_symmetry_features(
 def process_ensemble_features(
     data: Tokenized,
     random: np.random.Generator,
-    num_ensembles: int,
+    num_ensembles: Optional[int],
     ensemble_sample_replacement: bool,
     fix_single_ensemble: bool,
 ) -> dict[str, Tensor]:
@@ -1992,8 +1992,8 @@ def process_ensemble_features(
         The input to the model.
     random : np.random.Generator
         The random number generator.
-    num_ensembles : int
-        The maximum number of ensembles to sample.
+    num_ensembles : Optional[int]
+        The maximum number of ensembles to sample, None for all of them.
     ensemble_sample_replacement : bool
         Whether to sample with replacement.
 
@@ -2003,7 +2003,9 @@ def process_ensemble_features(
         The ensemble features.
 
     """
-    assert num_ensembles > 0, "Number of conformers sampled must be greater than 0."
+    assert num_ensembles is None or num_ensembles > 0, (
+        "Number of conformers sampled must be greater than 0."
+    )
 
     # Number of available conformers in the structure
     # s_ensemble_num = min(len(cropped.structure.ensemble), 24)  # Limit to 24 conformers DEBUG: TODO: remove !
@@ -2021,8 +2023,8 @@ def process_ensemble_features(
             ensemble_ref_idxs = random.integers(0, s_ensemble_num, (num_ensembles,))
         else:
             # Used in validation
-            if s_ensemble_num < num_ensembles:
-                # Take all available conformers
+            if num_ensembles is None or s_ensemble_num <= num_ensembles:
+                # Take all available conformers, in order
                 ensemble_ref_idxs = np.arange(0, s_ensemble_num)
             else:
                 # Sample without replacement
@@ -2291,7 +2293,7 @@ class Boltz2Featurizer:
         min_dist: float = 2.0,
         max_dist: float = 22.0,
         num_bins: int = 64,
-        num_ensembles: int = 1,
+        num_ensembles: Optional[int] = 1,
         ensemble_sample_replacement: bool = False,
         disto_use_ensemble: Optional[bool] = False,
         fix_single_ensemble: Optional[bool] = True,

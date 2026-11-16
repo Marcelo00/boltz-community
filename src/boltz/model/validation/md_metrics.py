@@ -11,7 +11,69 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+# Atoms the structures are superposed on before their fluctuation is measured; MDAnalysis
+# "nucleicbackbone", the set the stored RMSF targets were fitted with
+BACKBONE_ATOM_NAMES = ("P", "O5'", "C5'", "C3'", "O3'")
+
+# Atom pairs at most two bonds apart across an O3'(i)-P(i+1) link (atom of i, atom of i+1).
+# Their distance follows from the bond geometry, so they are never counted as clashing.
+LINK_EXCLUDED_PAIRS = (("O3'", "P"), ("O3'", "OP1"), ("O3'", "OP2"), ("O3'", "O5'"), ("C3'", "P"))
+
+# Ring atoms that define the local frame of a base, in the order that makes the frames of
+# purines and pyrimidines point to the same face
+BASE_RING_ATOMS = {True: ("C2", "C6", "C4"), False: ("C2", "C4", "C6")}
+
+# Part of the lDDT definition, not a choice: inclusion radius and the four error thresholds
+LDDT_CUTOFF = 15.0
 LDDT_THRESHOLDS = (0.5, 1.0, 2.0, 4.0)
+
+# Pairs within LDDT_CUTOFF + this margin in any MD frame are scored, so that the pairs
+# included for one frame are exactly those closer than LDDT_CUTOFF in it
+LDDT_PAIR_MARGIN = 2.0
+
+# Part of the eRMSD definition (Bottaro et al.): the ellipsoidal cutoff in scaled units, and
+# the scaling per Angstrom, which weights displacement out of the base plane more strongly
+ERMSD_CUTOFF = 2.4
+ERMSD_SCALE = (1 / 5.0, 1 / 5.0, 1 / 3.0)
+
+# Fluctuation below this (Angstrom) is no fluctuation: the structures of the set are copies of
+# one another, so the ratio of their fluctuation to the reference's has no value
+STATIC_TOLERANCE = 1e-3
+
+# The same for diversity, which lDDT measures in steps of 0.25 / number of pairs, so anything
+# below this is exactly zero. lDDT only reacts to pair distances that differ by at least 0.5 A,
+# so a set whose structures are merely very similar already counts as having no diversity.
+MIN_LDDT_DIVERSITY = 1e-6
+
+# The partial correlation of the pair-distance metrics needs four pairs, one more than its two
+# ranked variables and its control; below that none of the pair metrics is reported
+MIN_PAIRS = 4
+
+METRIC_NAMES = (
+    "lddt_nn",
+    "cov",
+    "div_ratio",
+    "lig_rmsd_f0",
+    "lig_prec_mean",
+    "lig_cov_mean",
+    "rmsf_spearman_na",
+    "rmsf_spearman_na_null",
+    "rmsf_logratio_na",
+    "rmsf_logratio_lig",
+    "lig_contact_mae",
+    "clash_free_na",
+    "clash_free_lig_na",
+    "chain_break",
+    "chain_break_severe",
+    "w1_na_mobile",
+    "w1_lig_na_mobile",
+    "dfluct_logratio_na",
+    "dfluct_pspearman_na",
+    "ermsd_cov",
+    "c4_dist_w1",
+    "rg_reldiff",
+    "rg_w1",
+)
 
 
 @dataclass(frozen=True)
@@ -28,12 +90,15 @@ class SystemIndex:
         (R,) representative atom of each nucleotide.
     c4_atoms : Tensor
         (R,) C4' atom of each nucleotide, -1 if missing.
+    base_atoms : Tensor
+        (R, 3) the base ring atoms that define the local frame, ordered (C2, C6, C4) for
+        purines and (C2, C4, C6) for pyrimidines; -1 where an atom is missing.
     backbone : Tensor
         (B,) backbone atoms used for superposition.
     links : Tensor
         (K, 2) O3'(i), P(i+1) atom pairs, including links between chains.
     link_neighbours : Tensor
-        (E, 2) atom pairs on both sides of a link, excluded from clashes.
+        (E, 2) atom pairs at most two bonds apart across a link, excluded from clashes.
     radii : Tensor
         (N,) van der Waals radius of every atom.
     ligands : tuple[Tensor, ...]
@@ -45,6 +110,7 @@ class SystemIndex:
     na_residue: Tensor
     rep_atoms: Tensor
     c4_atoms: Tensor
+    base_atoms: Tensor
     backbone: Tensor
     links: Tensor
     link_neighbours: Tensor
@@ -59,23 +125,21 @@ class SystemIndex:
 
 @dataclass(frozen=True)
 class MetricParams:
-    """Thresholds of the metrics."""
+    """The chosen thresholds of the metrics.
 
-    lddt_cutoff: float = 15.0
-    lddt_pair_margin: float = 2.0
+    Values that follow from a definition (lDDT, eRMSD) or are implementation details are
+    module constants instead.
+    """
+
     pocket_cutoff: float = 4.5
     contact_cutoff: float = 4.0
     contact_width: float = 0.25
     contact_set_min: float = 0.1
-    bound_cutoff: float = 4.0
-    bound_reference_min: float = 0.5
-    bound_fraction: float = 0.5
     clash_factor: float = 0.75
     chain_break_cutoff: float = 2.0
     chain_break_severe_cutoff: float = 2.5
     pair_cap: Optional[float] = 20.0
     mobile_fraction: float = 0.25
-    rmsf_floor: float = 1e-3
 
 
 @dataclass(frozen=True)
@@ -111,12 +175,11 @@ class Reference:
         Nucleotide pairs (indices into ``rep_atoms``).
     lig_pairs : tuple[PairSet, ...]
         Per ligand, (ligand atom, nucleotide) pairs.
-    clash_keep_na : Tensor
-        (A, A) nucleic-acid atom pairs that can clash (different nucleotides, not across a link).
-    clash_min_ratio_na : Tensor
-        (A, A) minimum over the exclusion frames of distance / (r_i + r_j).
-    clash_min_ratio_lig : tuple[Tensor, ...]
-        (L, A) per ligand, the same for ligand and nucleic-acid atoms.
+    clash_pairs_na : Tensor
+        (A, A) nucleic-acid atom pairs counted as clashes when too close: different
+        nucleotides, not across a link, and never that close in the MD frames.
+    clash_pairs_lig : tuple[Tensor, ...]
+        (L, A) per ligand, the ligand-nucleic acid atom pairs counted as clashes.
 
     """
 
@@ -125,9 +188,8 @@ class Reference:
     pockets: tuple[Tensor, ...]
     na_pairs: PairSet
     lig_pairs: tuple[PairSet, ...]
-    clash_keep_na: Tensor
-    clash_min_ratio_na: Tensor
-    clash_min_ratio_lig: tuple[Tensor, ...]
+    clash_pairs_na: Tensor
+    clash_pairs_lig: tuple[Tensor, ...]
 
 
 # --------------------------------------------------------------------------- #
@@ -169,11 +231,39 @@ def pair_distances(coords: Tensor, pairs: Tensor) -> Tensor:
     return (coords[:, pairs[0]] - coords[:, pairs[1]]).norm(dim=-1)
 
 
-def linked_nucleotides(system: SystemIndex) -> Tensor:
-    """Get the (K, 2) nucleotide pairs joined by an O3'-P link."""
+def base_ring_atoms(atoms_by_name: dict[str, int]) -> list[int]:
+    """Get the ring atoms that define a base frame, -1 where one is missing.
+
+    Purines are told apart by their N9; see ``BASE_RING_ATOMS`` for the order.
+    """
+    return [atoms_by_name.get(name, -1) for name in BASE_RING_ATOMS["N9" in atoms_by_name]]
+
+
+def na_atom_position(system: SystemIndex) -> Tensor:
+    """Get the (N,) position of each atom within ``na_atoms``, -1 for all other atoms."""
     position = torch.full((len(system.radii),), -1, dtype=torch.long)
     position[system.na_atoms] = torch.arange(len(system.na_atoms))
-    return system.na_residue[position[system.links]].reshape(-1, 2)
+    return position
+
+
+def linked_nucleotides(system: SystemIndex) -> Tensor:
+    """Get the (K, 2) nucleotide pairs joined by an O3'-P link."""
+    return system.na_residue[na_atom_position(system)[system.links]].reshape(-1, 2)
+
+
+def clash_candidate_pairs(system: SystemIndex) -> Tensor:
+    """Get the (A, A) nucleic-acid atom pairs whose closeness no bond explains.
+
+    Pairs within one nucleotide and the pairs across an O3'-P link are left out; the upper
+    triangle is kept, so each pair appears once.
+    """
+    residue = system.na_residue
+    keep = torch.triu(residue[:, None] != residue[None], diagonal=1)
+    if len(system.link_neighbours):
+        position = na_atom_position(system)
+        a, b = position[system.link_neighbours[:, 0]], position[system.link_neighbours[:, 1]]
+        keep[torch.minimum(a, b), torch.maximum(a, b)] = False
+    return keep
 
 
 def lddt_pairs(frames: Tensor, cutoff: float) -> Tensor:
@@ -185,7 +275,7 @@ def lddt_pairs(frames: Tensor, cutoff: float) -> Tensor:
     return torch.triu(keep, diagonal=1).nonzero().T
 
 
-def lddt_matrix(pred: Tensor, ref: Tensor, cutoff: float = 15.0) -> Tensor:
+def lddt_matrix(pred: Tensor, ref: Tensor) -> Tensor:
     """Get the global lDDT of every prediction against every reference.
 
     Parameters
@@ -194,8 +284,6 @@ def lddt_matrix(pred: Tensor, ref: Tensor, cutoff: float = 15.0) -> Tensor:
         (n, P) pair distances of the predictions.
     ref : Tensor
         (m, P) pair distances of the references on the same pairs.
-    cutoff : float
-        Inclusion radius on the reference distances.
 
     Returns
     -------
@@ -203,7 +291,7 @@ def lddt_matrix(pred: Tensor, ref: Tensor, cutoff: float = 15.0) -> Tensor:
         (n, m) lDDT values.
 
     """
-    mask = (ref < cutoff).float()
+    mask = (ref < LDDT_CUTOFF).float()
     norm = mask.sum(-1).clamp(min=1)
     out = torch.empty(len(pred), len(ref))
     for i, dist in enumerate(pred):
@@ -292,7 +380,7 @@ def spearman(x: Tensor, y: Tensor) -> float:
 
 
 def partial_spearman(x: Tensor, y: Tensor, z: Tensor) -> float:
-    """Get the Spearman correlation of x and y after removing the linear effect of z on the ranks."""
+    """Get the Spearman correlation of x and y, with the linear effect of z on the ranks removed."""
     if len(x) < 4:
         return float("nan")
     rz = _rank(z.double())
@@ -326,7 +414,10 @@ def wasserstein_1d(a: Tensor, b: Tensor) -> Tensor:
     a_sorted, b_sorted = a.double().sort(1).values, b.double().sort(1).values
     # Both quantile functions are constant between consecutive breakpoints k/n and k/m
     steps = torch.cat([torch.arange(1, n + 1) / n, torch.arange(1, m + 1) / m]).double()
-    bounds = torch.unique(torch.cat([torch.zeros(1, dtype=torch.float64), steps]).round(decimals=12))
+    # Rounded so that breakpoints the two grids share merge into one interval
+    bounds = torch.unique(
+        torch.cat([torch.zeros(1, dtype=torch.float64), steps]).round(decimals=12)
+    )
     widths = bounds[1:] - bounds[:-1]
     mid = (bounds[1:] + bounds[:-1]) / 2
     idx_a = (mid * n).floor().long().clamp(max=n - 1)
@@ -366,7 +457,9 @@ def ligand_contact_distances(coords: Tensor, ligand: Tensor, system: SystemIndex
     )
 
 
-def contact_mae(d_pred: Tensor, d_ref: Tensor, cutoff: float, width: float, set_min: float) -> float:
+def contact_mae(
+    d_pred: Tensor, d_ref: Tensor, cutoff: float, width: float, set_min: float
+) -> float:
     """Get the mean absolute error of soft contact occupancies over the contacted groups."""
     occ_pred = torch.sigmoid((cutoff - d_pred) / width).mean(0)
     occ_ref = torch.sigmoid((cutoff - d_ref) / width).mean(0)
@@ -374,25 +467,6 @@ def contact_mae(d_pred: Tensor, d_ref: Tensor, cutoff: float, width: float, set_
     if not contacted.any():
         return float("nan")
     return (occ_pred - occ_ref)[contacted].abs().mean().item()
-
-
-def bound_fraction_diff(
-    d_pred: Tensor, d_ref: Tensor, cutoff: float, reference_min: float, fraction: float
-) -> float:
-    """Get the absolute difference of the bound fractions.
-
-    A structure is bound when it keeps at least ``fraction`` of the reference contacts, the
-    groups in contact in at least ``reference_min`` of the reference structures.
-    """
-    reference_contacts = (d_ref < cutoff).float().mean(0) >= reference_min
-    if not reference_contacts.any():
-        return float("nan")
-
-    def bound(d: Tensor) -> float:
-        kept = (d[:, reference_contacts] < cutoff).float().mean(1)
-        return (kept >= fraction).float().mean().item()
-
-    return abs(bound(d_pred) - bound(d_ref))
 
 
 def clash_ratio(coords_a: Tensor, coords_b: Tensor, radii_a: Tensor, radii_b: Tensor) -> Tensor:
@@ -414,6 +488,9 @@ def clash_counts(
 ) -> tuple[Tensor, Tensor]:
     """Count the clashes of every structure.
 
+    The factor must be the one the reference excluded its bonded pairs with, otherwise the
+    exclusions and the threshold disagree.
+
     Returns
     -------
     tuple[Tensor, Tensor]
@@ -421,16 +498,95 @@ def clash_counts(
 
     """
     na, radii = system.na_atoms, system.radii
-    keep_na = reference.clash_keep_na & (reference.clash_min_ratio_na >= factor)
     na_counts = torch.zeros(len(pred))
     lig_counts = torch.zeros(len(pred))
     for s, coords in enumerate(pred):
         ratio = clash_ratio(coords[None, na], coords[None, na], radii[na], radii[na])[0]
-        na_counts[s] = ((ratio < factor) & keep_na).sum()
-        for ligand, min_ratio in zip(system.ligands, reference.clash_min_ratio_lig):
+        na_counts[s] = ((ratio < factor) & reference.clash_pairs_na).sum()
+        for ligand, keep in zip(system.ligands, reference.clash_pairs_lig):
             ratio = clash_ratio(coords[None, ligand], coords[None, na], radii[ligand], radii[na])[0]
-            lig_counts[s] += ((ratio < factor) & (min_ratio >= factor)).sum()
+            lig_counts[s] += ((ratio < factor) & keep).sum()
     return na_counts, lig_counts
+
+
+def base_frames(coords: Tensor, base_atoms: Tensor) -> tuple[Tensor, Tensor]:
+    """Get the local coordinate system of each base from its ring atoms.
+
+    Parameters
+    ----------
+    coords : Tensor
+        (n, N, 3) structures.
+    base_atoms : Tensor
+        (R, 3) ring atoms per base, ordered so that the frames of purines and pyrimidines
+        point to the same face of the base.
+
+    Returns
+    -------
+    tuple[Tensor, Tensor]
+        (n, R, 3) base centres and (n, R, 3, 3) orthonormal axes as rows.
+
+    """
+    a0, a1 = coords[:, base_atoms[:, 0]], coords[:, base_atoms[:, 1]]
+    origin = coords[:, base_atoms].mean(2)
+    x = torch.nn.functional.normalize(a0 - origin, dim=-1)
+    z = torch.nn.functional.normalize(torch.linalg.cross(x, a1 - origin), dim=-1)
+    return origin, torch.stack([x, torch.linalg.cross(z, x), z], dim=-2)
+
+
+def g_vectors(coords: Tensor, base_atoms: Tensor) -> Tensor:
+    """Get the G-vectors of every ordered pair of bases (Bottaro et al., eRMSD).
+
+    The position of each base centre in the local frame of another base is scaled
+    anisotropically; pairs outside the resulting ellipsoid get a zero vector.
+
+    Returns
+    -------
+    Tensor
+        (n, R, R, 4) G-vectors.
+
+    """
+    origin, axes = base_frames(coords, base_atoms)
+    diff = origin[:, None, :, :] - origin[:, :, None, :]  # [:, i, j] = centre j minus centre i
+    scale = torch.tensor(ERMSD_SCALE, dtype=coords.dtype)
+    # [n, i, j, d] = the i -> j vector projected on axis d of base i's frame
+    scaled = torch.einsum("nijc,nicd->nijd", diff, axes.transpose(-2, -1)) * scale
+    norm = scaled.norm(dim=-1, keepdim=True).clamp(min=1e-9)
+
+    angle = torch.pi * norm / ERMSD_CUTOFF
+    tail = (1 + torch.cos(angle)) * ERMSD_CUTOFF / torch.pi
+    g = torch.cat([scaled * torch.sin(angle) / angle, tail], dim=-1)
+    inside = (norm < ERMSD_CUTOFF) & ~torch.eye(len(base_atoms), dtype=torch.bool)[None, :, :, None]
+    return g * inside
+
+
+def ermsd_set_matrix(pred: Tensor, ref: Tensor, system: SystemIndex) -> Optional[Tensor]:
+    """Get the (n, m) eRMSD of every prediction against every reference, None if too few bases."""
+    bases = system.base_atoms[(system.base_atoms >= 0).all(1)]
+    if len(bases) < 2:
+        return None
+    return ermsd_matrix(g_vectors(pred, bases), g_vectors(ref, bases))
+
+
+def ermsd_matrix(g_pred: Tensor, g_ref: Tensor) -> Tensor:
+    """Get the eRMSD of every prediction against every reference from their G-vectors.
+
+    Parameters
+    ----------
+    g_pred : Tensor
+        (n, R, R, 4) G-vectors of the predictions.
+    g_ref : Tensor
+        (m, R, R, 4) G-vectors of the references.
+
+    Returns
+    -------
+    Tensor
+        (n, m) eRMSD values.
+
+    """
+    num_bases = g_pred.shape[1]
+    flat_pred = g_pred.reshape(len(g_pred), -1)
+    flat_ref = g_ref.reshape(len(g_ref), -1)
+    return torch.cdist(flat_pred, flat_ref) / num_bases**0.5
 
 
 def c4_distances(coords: Tensor, system: SystemIndex) -> Tensor:
@@ -493,7 +649,7 @@ def build_reference(frames: Tensor, system: SystemIndex, params: MetricParams) -
     """Compute the MD-derived quantities that are fixed per system.
 
     Atom pairs that clash in some MD frame are treated as bonded (e.g. covalent ligand links)
-    and are not counted as clashes.
+    and are never counted as clashes.
 
     Parameters
     ----------
@@ -511,28 +667,20 @@ def build_reference(frames: Tensor, system: SystemIndex, params: MetricParams) -
 
     """
     frame0 = frames[0]
-
-    res = system.na_residue
-    keep = torch.triu(res[:, None] != res[None], diagonal=1)
-    position = torch.full((len(system.radii),), -1, dtype=torch.long)
-    position[system.na_atoms] = torch.arange(len(system.na_atoms))
-    if len(system.link_neighbours):
-        a, b = position[system.link_neighbours[:, 0]], position[system.link_neighbours[:, 1]]
-        keep[torch.minimum(a, b), torch.maximum(a, b)] = False
-
+    na, factor = system.na_atoms, params.clash_factor
+    keep = clash_candidate_pairs(system) & (min_clash_ratio(frames, na, na, system.radii) >= factor)
     na_pairs, lig_pairs = pair_sets(frames, system, params.pair_cap, params.mobile_fraction)
     return Reference(
         frame0=frame0,
-        lddt_pairs=lddt_pairs(frames, params.lddt_cutoff + params.lddt_pair_margin),
+        lddt_pairs=lddt_pairs(frames, LDDT_CUTOFF + LDDT_PAIR_MARGIN),
         pockets=tuple(
             pocket_atoms(frame0, ligand, system, params.pocket_cutoff) for ligand in system.ligands
         ),
         na_pairs=na_pairs,
         lig_pairs=lig_pairs,
-        clash_keep_na=keep,
-        clash_min_ratio_na=min_clash_ratio(frames, system.na_atoms, system.na_atoms, system.radii),
-        clash_min_ratio_lig=tuple(
-            min_clash_ratio(frames, ligand, system.na_atoms, system.radii) for ligand in system.ligands
+        clash_pairs_na=keep,
+        clash_pairs_lig=tuple(
+            min_clash_ratio(frames, ligand, na, system.radii) >= factor for ligand in system.ligands
         ),
     )
 
@@ -548,13 +696,16 @@ def _offdiag_mean(x: Tensor) -> float:
 
 
 def _nanmean(values: list[float]) -> float:
-    values = [v for v in values if v == v]
-    return sum(values) / len(values) if values else float("nan")
+    """Average the defined values, NaN if there are none."""
+    defined = [v for v in values if not math.isnan(v)]
+    return sum(defined) / len(defined) if defined else float("nan")
 
 
-def _log_ratio(pred: Tensor, ref: Tensor, floor: float) -> float:
-    """Get log(median(pred) / median(ref)), with both medians floored."""
-    return torch.log(median(pred).clamp(min=floor) / median(ref).clamp(min=floor)).item()
+def _log_ratio(pred: Tensor, ref: Tensor) -> float:
+    """Get log(median(pred) / median(ref)), NaN if either set does not fluctuate."""
+    if len(pred) == 0 or pred.max() < STATIC_TOLERANCE or ref.max() < STATIC_TOLERANCE:
+        return float("nan")
+    return torch.log(median(pred) / median(ref)).item()
 
 
 def score_ensemble(
@@ -585,36 +736,44 @@ def score_ensemble(
     Returns
     -------
     dict[str, float]
-        The metric values.
+        The metric values, NaN where a metric is undefined (e.g. no ligand).
 
     """
     out = {}
-    out.update(_set_metrics(pred, ref_subset, reference, params))
+    out.update(_set_metrics(pred, ref_subset, reference))
     out.update(_pose_metrics(pred, ref_subset, reference, system))
-    out.update(_rmsf_metrics(pred, ref_frames, reference, system, params))
+    out.update(_rmsf_metrics(pred, ref_frames, reference, system))
     out.update(_contact_metrics(pred, ref_frames, system, params))
     out.update(_validity_metrics(pred, reference, system, params))
-    out.update(pair_set_metrics(pred, ref_frames, reference.na_pairs, reference.lig_pairs, system, params))
+    out.update(pair_set_metrics(pred, ref_frames, reference.na_pairs, reference.lig_pairs, system))
     out.update(_backbone_metrics(pred, ref_frames, system))
-    return out
+    out.update(_ermsd_metrics(pred, ref_subset, system))
+    return {name: out.get(name, float("nan")) for name in METRIC_NAMES}
 
 
-def _set_metrics(pred, ref_subset, reference, params) -> dict[str, float]:
+def _set_metrics(pred: Tensor, ref_subset: Tensor, reference: Reference) -> dict[str, float]:
     """Precision, coverage and diversity from lDDT matrices."""
     pairs = reference.lddt_pairs
     d_pred = pair_distances(pred, pairs)
     d_ref = pair_distances(ref_subset, pairs)
-    l_pr = lddt_matrix(d_pred, d_ref, params.lddt_cutoff)
-    d_pp = _offdiag_mean(1 - lddt_matrix(d_pred, d_pred, params.lddt_cutoff))
-    d_rr = _offdiag_mean(1 - lddt_matrix(d_ref, d_ref, params.lddt_cutoff))
+    l_pr = lddt_matrix(d_pred, d_ref)
+    d_pp = _offdiag_mean(1 - lddt_matrix(d_pred, d_pred))
+    d_rr = _offdiag_mean(1 - lddt_matrix(d_ref, d_ref))
     return {
         "lddt_nn": l_pr.max(1).values.mean().item(),
         "cov": l_pr.max(0).values.mean().item(),
-        "div_ratio": math.log(max(d_pp, 1e-6) / d_rr) if d_rr > 0 else float("nan"),
+        # A set of identical structures has no diversity, so the ratio has no finite value
+        "div_ratio": (
+            math.log(d_pp / d_rr)
+            if min(d_pp, d_rr) > MIN_LDDT_DIVERSITY
+            else float("nan")
+        ),
     }
 
 
-def _pose_metrics(pred, ref_subset, reference, system) -> dict[str, float]:
+def _pose_metrics(
+    pred: Tensor, ref_subset: Tensor, reference: Reference, system: SystemIndex
+) -> dict[str, float]:
     """Ligand pose accuracy, precision and coverage after a pocket fit, averaged over ligands."""
     per_ligand = []
     for ligand, pocket in zip(system.ligands, reference.pockets):
@@ -632,7 +791,9 @@ def _pose_metrics(pred, ref_subset, reference, system) -> dict[str, float]:
     return {key: _nanmean([v[key] for v in per_ligand]) for key in per_ligand[0]}
 
 
-def _rmsf_metrics(pred, ref_frames, reference, system, params) -> dict[str, float]:
+def _rmsf_metrics(
+    pred: Tensor, ref_frames: Tensor, reference: Reference, system: SystemIndex
+) -> dict[str, float]:
     """Where (Spearman) and how much (log ratio) the structures fluctuate."""
     rmsf_pred = rmsf(kabsch_align(pred, reference.frame0, system.backbone))
     rmsf_ref = rmsf(kabsch_align(ref_frames, reference.frame0, system.backbone))
@@ -644,34 +805,39 @@ def _rmsf_metrics(pred, ref_frames, reference, system, params) -> dict[str, floa
     centroids = segment_mean(reference.frame0[system.na_atoms].double(), system.na_residue, num_nt)
     centre_dist = (centroids - reference.frame0[system.backbone].double().mean(0)).norm(dim=-1)
 
-    floor = params.rmsf_floor
-    static = nt_pred.max() < floor  # identical structures: the ranks would be numerical noise
+    static = nt_pred.max() < STATIC_TOLERANCE  # identical structures: the ranks are numerical noise
     return {
         "rmsf_spearman_na": float("nan") if static else spearman(nt_pred, nt_ref),
         "rmsf_spearman_na_null": spearman(centre_dist, nt_ref),
-        "rmsf_logratio_na": _log_ratio(nt_pred, nt_ref, floor),
+        "rmsf_logratio_na": _log_ratio(nt_pred, nt_ref),
         "rmsf_logratio_lig": _nanmean([
-            _log_ratio(rmsf_pred[ligand], rmsf_ref[ligand], floor) for ligand in system.ligands
+            _log_ratio(rmsf_pred[ligand], rmsf_ref[ligand]) for ligand in system.ligands
         ]),
     }
 
 
-def _contact_metrics(pred, ref_frames, system, params) -> dict[str, float]:
-    """Ligand-nucleotide contact occupancy and bound fraction, averaged over ligands."""
-    mae, bound = [], []
-    for ligand in system.ligands:
-        d_pred = ligand_contact_distances(pred, ligand, system)
-        d_ref = ligand_contact_distances(ref_frames, ligand, system)
-        mae.append(contact_mae(d_pred, d_ref, params.contact_cutoff, params.contact_width, params.contact_set_min))
-        bound.append(bound_fraction_diff(
-            d_pred, d_ref, params.bound_cutoff, params.bound_reference_min, params.bound_fraction
-        ))
+def _contact_metrics(
+    pred: Tensor, ref_frames: Tensor, system: SystemIndex, params: MetricParams
+) -> dict[str, float]:
+    """Ligand-nucleotide contact occupancy, averaged over ligands."""
     if not system.ligands:
         return {}
-    return {"lig_contact_mae": _nanmean(mae), "bound_frac_diff": _nanmean(bound)}
+    mae = [
+        contact_mae(
+            ligand_contact_distances(pred, ligand, system),
+            ligand_contact_distances(ref_frames, ligand, system),
+            params.contact_cutoff,
+            params.contact_width,
+            params.contact_set_min,
+        )
+        for ligand in system.ligands
+    ]
+    return {"lig_contact_mae": _nanmean(mae)}
 
 
-def _validity_metrics(pred, reference, system, params) -> dict[str, float]:
+def _validity_metrics(
+    pred: Tensor, reference: Reference, system: SystemIndex, params: MetricParams
+) -> dict[str, float]:
     """Clash-free and chain-break fractions over the structures."""
     na_counts, lig_counts = clash_counts(pred, reference, system, params.clash_factor)
     out = {"clash_free_na": (na_counts == 0).float().mean().item()}
@@ -680,7 +846,8 @@ def _validity_metrics(pred, reference, system, params) -> dict[str, float]:
     if len(system.links):
         link = pair_distances(pred, system.links.T)
         out["chain_break"] = (link > params.chain_break_cutoff).any(1).float().mean().item()
-        out["chain_break_severe"] = (link > params.chain_break_severe_cutoff).any(1).float().mean().item()
+        severe = link > params.chain_break_severe_cutoff
+        out["chain_break_severe"] = severe.any(1).float().mean().item()
     return out
 
 
@@ -690,22 +857,21 @@ def pair_set_metrics(
     na_pairs: PairSet,
     lig_pairs: tuple[PairSet, ...],
     system: SystemIndex,
-    params: MetricParams,
 ) -> dict[str, float]:
     """Distance-distribution (W1) and distance-fluctuation metrics on given pair sets."""
     out = {}
-    if na_pairs.pairs.shape[1] >= 4:
+    if na_pairs.pairs.shape[1] >= MIN_PAIRS:
         nt_pairs = system.rep_atoms[na_pairs.pairs]
         d_pred, d_ref = pair_distances(pred, nt_pairs), pair_distances(ref_frames, nt_pairs)
         mobile = na_pairs.mobile
         std_pred, std_ref = d_pred.std(0), d_ref.std(0)
         out["w1_na_mobile"] = wasserstein_1d(d_pred[:, mobile].T, d_ref[:, mobile].T).mean().item()
-        out["dfluct_logratio_na"] = _log_ratio(std_pred[mobile], std_ref[mobile], params.rmsf_floor)
+        out["dfluct_logratio_na"] = _log_ratio(std_pred[mobile], std_ref[mobile])
         out["dfluct_pspearman_na"] = partial_spearman(std_pred, std_ref, d_ref.mean(0))
 
     w1 = []
     for lig_set in lig_pairs:
-        if lig_set.pairs.shape[1] < 4:
+        if lig_set.pairs.shape[1] < MIN_PAIRS:
             continue
         d_pred = ligand_pair_distances(pred, lig_set.pairs, system)[:, lig_set.mobile]
         d_ref = ligand_pair_distances(ref_frames, lig_set.pairs, system)[:, lig_set.mobile]
@@ -715,7 +881,15 @@ def pair_set_metrics(
     return out
 
 
-def _backbone_metrics(pred, ref_frames, system) -> dict[str, float]:
+def _ermsd_metrics(pred: Tensor, ref_subset: Tensor, system: SystemIndex) -> dict[str, float]:
+    """Base-geometry coverage: how well the samples cover the reference base geometries."""
+    matrix = ermsd_set_matrix(pred, ref_subset, system)
+    if matrix is None:
+        return {}
+    return {"ermsd_cov": matrix.min(0).values.mean().item()}
+
+
+def _backbone_metrics(pred: Tensor, ref_frames: Tensor, system: SystemIndex) -> dict[str, float]:
     """Local C4' backbone geometry and nucleic-acid size, compared as distributions."""
     out = {}
     dist_pred, dist_ref = c4_distances(pred, system), c4_distances(ref_frames, system)

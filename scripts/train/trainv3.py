@@ -41,8 +41,12 @@ class TrainConfig:
         The matmul precision.
     find_unused_parameters : Optional[bool]
         Find unused parameters.
+    monitor : str
+        The validation metric to checkpoint on.
+    monitor_mode : str
+        Whether a high ("max") or a low ("min") value of that metric is better.
     save_top_k : Optional[int]
-        Save the top k checkpoints by validation lddt.
+        Save the top k checkpoints by the monitored metric.
     validation_only : bool
         Run validation only, on the pretrained or the resumed model.
     debug : bool
@@ -59,6 +63,8 @@ class TrainConfig:
     wandb: Optional[dict] = None
     matmul_precision: Optional[str] = None
     find_unused_parameters: Optional[bool] = False
+    monitor: str = "val/lddt"
+    monitor_mode: str = "max"
     save_top_k: Optional[int] = 1
     validation_only: bool = False
     debug: bool = False
@@ -137,8 +143,8 @@ def train(raw_config: str, args: list[str]) -> None:
 
     callbacks = [
         ModelCheckpoint(
-            monitor="val/lddt",
-            mode="max",
+            monitor=cfg.monitor,
+            mode=cfg.monitor_mode,
             save_top_k=cfg.save_top_k,
             save_last=True,
         )

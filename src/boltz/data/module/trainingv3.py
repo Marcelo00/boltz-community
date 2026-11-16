@@ -63,7 +63,7 @@ class DataConfig:
     val_name: str = "md_val"
     num_val_records: Optional[int] = None
     val_seed: int = 0
-    val_num_ensembles: int = 20
+    val_num_ensembles: Optional[int] = None
     overfit: Optional[int] = None
 
 
@@ -267,7 +267,9 @@ class ValidationDataset(BaseDataset):
     """Dataset over the selected records of each dataset, with fixed random MD frames.
 
     Each record gets ``val_num_ensembles`` frames drawn without replacement, seeded by
-    the record id, so the same frames are used in every validation round.
+    the record id, so the same frames are used in every validation round. With None, or
+    with at least as many as the record has, all frames are used in trajectory order,
+    which the MD validator requires.
 
     With ``overfit`` the datasets are the training ones, so validation measures how
     well the training records are fit.
